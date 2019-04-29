@@ -1,0 +1,397 @@
+---
+title: "Stats 451 Final Project"
+author: "Junfeng Luo (jfluo), Dong Ding (dingdo)"
+output:
+  html_document:
+    fig_caption: yes
+    fig_height: 6
+    fig_width: 6
+    df_print: paged
+  pdf_document:
+    fig_caption: yes
+    fig_height: 4
+    fig_width: 4
+    keep_tex: yes
+---
+
+```{r setup, include = FALSE, message = FALSE, tidy = TRUE}
+# 80: --------------------------------------------------------------------------
+#! We generally don't need to see the code in the results document.
+knitr::opts_chunk$set(warning = FALSE, echo = TRUE, message = FALSE)
+#! Make sure all chunks have a label. This one is labelled 'setup'.
+```
+
+```{r load packages, warning = FALSE, message = FALSE}
+library(dplyr) # use 'dplyr' to clean data
+library(rstan) # use 'stan' for Bayesian Inference
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+# Processing Data
+```{r processing data}
+data = read.csv("https://raw.githubusercontent.com/jfluo100/Stats451_FinalProject/master/Brooklyn_Bridge_Automated_Pedestrian_Counts_Demonstration_Project.csv") # load data from github
+
+dim(data) # 7296 is the number of observations (7296/24 = 304 days), 12 is the number of variables
+names(data) # the name of variables
+
+unique(data[, "weather_summary"]) # there are 10 unique weather categories
+
+data = data %>%
+  filter(events == '') %>%
+  select(-lat, -long, -events, -Location1) # only keep the variables we are interested in
+
+```
+
+# What does the data look like?
+Our data is about the number of pedestrians that walks across the Brooklyn Bridge along with infomation about time, weather, temperature, etc.
+```{r first rows of data}
+head(data)
+```
+
+It is obvious that the volume of pedestrians fluctuates in a single day.  
+We can see that most people cross the bridge between 10am and 8pm.  
+```{r one day}
+data_first_day = data[1:24, "Pedestrians"]
+plot(x = 1:24, y = data_first_day, xlab = 'time/hour', ylab = 'number of pedestrians')
+```
+
+It is better we set "per day" as the unit for time.  
+```{r by day}
+day_sum = rep(0, times = dim(data)[1]) 
+day_Mhtn = rep(0, times = dim(data)[1]) 
+day_Brkln = rep(0, times = dim(data)[1]) 
+
+i = 0
+while( i < dim(data)[1]/24 ){
+  day_sum[(24*i+1):(24*i+24)] = sum(data[, 'Pedestrians'][(24*i+1):(24*i+24)])
+  day_Mhtn[(24*i+1):(24*i+24)] = sum(data[, 'Towards.Manhattan'][(24*i+1):(24*i+24)])
+  day_Brkln[(24*i+1):(24*i+24)] = sum(data[, 'Towards.Brooklyn'][(24*i+1):(24*i+24)])
+  i = i + 1
+}
+
+data = mutate(data, day_sum = day_sum, day_Mhtn = day_Mhtn, day_Brkln = day_Brkln) # new dataset
+```
+
+
+## Model Selection
+Let us take a look at the distribution of number of pedestrians by day:  
+```{r fig.height = 4, fig.width = 4}
+data_by_day = data[seq(1, 6744, by = 24), 'day_sum']
+data_Manhattan = data[seq(1, 6744, by = 24), 'day_Mhtn']
+data_Brooklyn = data[seq(1, 6744, by = 24), 'day_Brkln']
+
+hist(data_by_day, breaks = 8, xlab = 'number of pedestrians by day')
+hist(data_by_day, breaks = 20, xlab = 'number of pedestrians by day')
+hist(data_by_day, breaks = 40, xlab = 'number of pedestrians by day')
+```
+
+Histogram are drawn with different number of bars (same data). It makes sense to use either Gaussian distribution or Poisson distribution here. Both of them are used here.  
+
+
+# Aplly *Stan* Package to Data
+
+## Studying the Influence of weather
+```{r good day and bad day}
+## good day and bad day
+start = seq(from = 12, to = 19, by = 1) # throughout the year, 11am ~ 6pm are rush hours
+index = start
+tmp = start
+i = 0
+while( i < dim(data)[1]/24 ){
+  tmp = tmp+24
+  index = c(index, tmp)
+  i = i+1
+}
+
+data_weather = data[index, c('Pedestrians', 'weather_summary')] # only contains data during rush hours
+
+data_good_weather = filter(data_weather, weather_summary %in% c('clear-night', 'clear-day'))[, 'Pedestrians']
+data_bad_weather = filter(data_weather, weather_summary %in% c('rain', 'fog', 'snow', 'sleet', 'cloudy', 'wind', 'partly-cloudy-night', 'partly-cloudy-day'))[, 'Pedestrians']
+```
+"Clear-day" and "clear-night" are taken as "good weather", other days are treated as "bad weather". Under this classification, there are 3279 hours of good weather and 3465 hours of bad weather.  
+
+
+### 1) Normal Model
+```{r good day and bad day normal model}
+## good day and bad day normal model
+model_string <- "
+data {
+  int<lower = 0> n1;
+  int<lower = 0> n2;
+  real y1[n1];
+  real y2[n2];
+}
+
+parameters {
+  real mu1;
+  real<lower = 0> sigma1;
+  real mu2;
+  real<lower = 0> sigma2;
+}
+
+model {  
+  for(i in 1:n1 ) {
+    y1[i] ~ normal(mu1, sigma1);
+  }
+  for(i in 1:n2 ) {
+    y2[i] ~ normal(mu2, sigma2);
+  }
+}
+
+generated quantities {
+}
+"
+
+data_list_weather <- list(y1 = data_good_weather, y2 = data_bad_weather, n1 = length(data_good_weather), n2 = length(data_bad_weather))
+
+
+# Compiling and producing posterior samples from the model.
+stan_samples <- stan(model_code = model_string, data = data_list_weather)
+
+# Plotting and summarizing the posterior distribution
+stan_samples
+plot(stan_samples)
+```
+
+We can see that when the weather is good, the number of pedestrians per hour would follow $N(\mu = 1741, \sigma = 736)$. When the weather is bad, the number of pedestrians per hour would follow $N(\mu = 1368, \sigma = 738)$. We can conclude that there will probably be more pedestrians when the weather is good. Less people will cross the river when it is rainy, cloudy, snowy or sleety.  
+
+### 2) Poisson Model
+```{r good day and bad day  poisson model}
+## good day and bad day  possion model
+model_string <- "
+data {
+int<lower = 0> n1;
+int<lower = 0> n2;
+int y1[n1];
+int y2[n2];
+}
+
+parameters {
+real<lower = 0> lambda1;
+real<lower = 0> lambda2;
+}
+
+model {  
+for(i in 1:n1 ) {
+y1[i] ~ poisson(lambda1);
+}
+for(i in 1:n2 ) {
+y2[i] ~ poisson(lambda2);
+}
+}
+
+generated quantities {
+}
+"
+data_list_weather <- list(y1 = data_good_weather, y2 = data_bad_weather, n1 = length(data_good_weather), n2 = length(data_bad_weather))
+
+# Compiling and producing posterior samples from the model.
+stan_samples <- stan(model_code = model_string, data = data_list_weather)
+
+# Plotting and summarizing the posterior distribution
+stan_samples
+plot(stan_samples)
+```
+
+It can be seen that when we use Possion model, the outcome is also easy to interpret. Good weather gives $Pois(\lambda = 1741)$ while bad weather gives $Pois(\lambda = 1368)$. 
+In terms of mean, or expected value, two models come up with the same result.
+
+
+## Studying the Influence of Temperature
+
+Temperature is another major factor that affects the number of pedestrians.
+
+```{r temperature (3 categories)}
+
+data_temperature = data[index, c('Pedestrians', 'temperature')] # only contains data during rush hours
+
+plot(data_temperature, xlab = 'number of pedestrians per hour', ylab = 'temperature/°„F')
+
+data_high_temperature = filter(data_temperature, temperature >= 78.8)[, 'Pedestrians'] # above 78.8°„F (26°„C) would be warm/hot
+data_medium_temperature = filter(data_temperature, temperature < 78.8 & temperature >= 50)[, 'Pedestrians'] # 50~78.8°„F (8~26°„C) would be cool
+data_low_temperature = filter(data_temperature, temperature < 50)[, 'Pedestrians'] # below 50°„F (8°„C) would be cold
+
+```
+
+By talking a quick look at the temperature-volume plot, we can make a guess that higher temperature influences the volume positively.
+
+### 1) Normal Model
+```{r temperature  normal model}
+model_string <- "
+data {
+  int<lower = 0> n1;
+  int<lower = 0> n2;
+  int<lower = 0> n3;
+  real y1[n1];
+  real y2[n2];
+  real y3[n3];
+}
+
+parameters {
+  real mu1;
+  real<lower = 0> sigma1;
+  real mu2;
+  real<lower = 0> sigma2;
+  real mu3;
+  real<lower = 0> sigma3;
+}
+
+model {  
+  for(i in 1:n1 ) {
+    y1[i] ~ normal(mu1, sigma1);
+  }
+  for(i in 1:n2 ) {
+    y2[i] ~ normal(mu2, sigma2);
+  }
+  for(i in 1:n3 ) {
+    y3[i] ~ normal(mu3, sigma3);
+  }
+}
+
+generated quantities {
+}
+"
+
+data_list_temperature <- list(y1 = data_high_temperature, y2 = data_medium_temperature, y3 = data_low_temperature, n1 = length(data_high_temperature), n2 = length(data_medium_temperature), n3 = length(data_low_temperature))
+
+
+# Compiling and producing posterior samples from the model.
+stan_samples <- stan(model_code = model_string, data = data_list_temperature)
+
+# Plotting and summarizing the posterior distribution
+stan_samples
+
+plot(stan_samples)
+```
+
+On warm or hot days, there are typically 2001 people who cross the bridge every busy hour. When the temperature is medium, the number is 1811. Only 1127 people walk through the bridge when it is cold.
+
+### 2) Poisson Model
+```{r temperature  poisson model}
+model_string <- "
+data {
+  int<lower = 0> n1;
+  int<lower = 0> n2;
+  int<lower = 0> n3;
+  int y1[n1];
+  int y2[n2];
+  int y3[n3];
+}
+
+parameters {
+real<lower = 0> lambda1;
+real<lower = 0> lambda2;
+real<lower = 0> lambda3;
+}
+
+model {  
+for(i in 1:n1 ) {
+y1[i] ~ poisson(lambda1);
+}
+for(i in 1:n2 ) {
+y2[i] ~ poisson(lambda2);
+}
+for(i in 1:n3) {
+y3[i] ~ poisson(lambda3);
+}
+}
+
+generated quantities {
+}
+"
+data_list <- list(y1 = data_high_temperature, y2 = data_medium_temperature, y3 = data_low_temperature, n1 = length(data_high_temperature), n2 = length(data_medium_temperature), n3 = length(data_low_temperature))
+
+
+# Compiling and producing posterior samples from the model.
+stan_samples <- stan(model_code = model_string, data = data_list)
+
+# Plotting and summarizing the posterior distribution
+stan_samples
+
+plot(stan_samples)
+```
+
+Similar result is concluded from Poisson model:  
+High temperature -> $Pois(\lambda = 2001)$  
+Medium temperature -> $Pois(\lambda = 1811)$  
+Low temperature -> $Pois(\lambda = 1128)$  
+
+
+# Simulation
+
+## Simulation of Weather
+```{r simulation when weather is known}
+## weather part
+
+# normal ##########
+# we should have all data be greater than 0
+# so we use truncated normal distribution here
+if (!require('truncnorm')) install.packages('truncnorm')
+library('truncnorm')
+par(mfrow = c(2, 2))
+
+good_weather_sim_n = rtruncnorm(n = 1040, a = 0, b = Inf, mean = 1740.57, sd = 735.57)
+hist(good_weather_sim_n, main = "simulation of good weather")
+hist(data_good_weather, main = "actual data of good weather")
+
+bad_weather_sim_n = rtruncnorm(n = 1208, a = 0, b = Inf, mean = 1367.25, sd = 737.26)
+hist(bad_weather_sim_n, main = "simulation of bad weather")
+hist(data_bad_weather, main = "actual data of bad weather")
+
+
+# Poisson ##########
+good_weather_sim_p = rpois(n = 1040, lambda = 1740.57)
+hist(good_weather_sim_p, main = "simulation of good weather")
+hist(data_good_weather, main = "actual data of good weather")
+
+bad_weather_sim_p = rpois(n = 1208, lambda = 1367.25)
+hist(bad_weather_sim_p, main = "simulation of bad weather")
+hist(data_bad_weather, main = "actual data of bad weather")
+
+```
+
+## Simulation of Temperature
+```{r simulation when temperature is know}
+## temperature part
+
+# normal #########
+par(mfrow = c(3, 2))
+temp_high_sim_n = rtruncnorm(n = 328, a = 0, b = Inf, mean = 2000.49, sd = 507.19)
+hist(temp_high_sim_n, main = "simulation of high temperature")
+hist(data_high_temperature, main = "actual data of high temperature")
+
+temp_medium_sim_n = rtruncnorm(n = 939, a = 0, b = Inf, mean = 1811.81, sd = 749.19)
+hist(temp_medium_sim_n, main = "simulation of medium temperature")
+hist(data_medium_temperature, main = "actual data of medium temperature")
+
+temp_low_sim_n = rtruncnorm(n = 981, a = 0, b = Inf, mean = 1127.74, sd = 622.99)
+hist(temp_low_sim_n, main = "simulation of low temperature")
+hist(data_low_temperature, main = "actual data of low temperature")
+
+
+# Poisson #########
+temp_high_sim_p = rpois(n = 328, lambda = 2000.61)
+hist(temp_high_sim_p, main = "simulation of high temperature")
+hist(data_high_temperature, main = "actual data of high temperature")
+
+temp_medium_sim_p = rpois(n = 939, lambda = 1811.68)
+hist(temp_medium_sim_p, main = "simulation of medium temperature")
+hist(data_medium_temperature, main = "actual data of medium temperature")
+
+temp_low_sim_p = rpois(n = 981, lambda = 1127.16)
+hist(temp_low_sim_p, main = "simulation of low temperature")
+hist(data_low_temperature, main = "actual data of low temperature")
+
+```
+
+We can see that the simulations are quite accurate.
+
+# Conclusion
+
+Compared to bad days, 25% more people cross the bridge when the weather is fine.  
+
+40% less people pass the bridge when it is cold outside. Maybe summer is the time tourists hike in New York City.  
+
+The simulation made by Bayesian Statistic is quite accurate.  
+
